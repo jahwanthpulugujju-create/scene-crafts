@@ -18,6 +18,20 @@ interface PlannedScene {
   duration: number;
 }
 
+const CAMERA_KEYWORDS = [
+  "wide", "close-up", "closeup", "close up", "tracking", "over-the-shoulder",
+  "over the shoulder", "medium shot", "long shot", "aerial", "pan", "dolly",
+  "crane", "handheld", "low angle", "high angle", "establishing", "pov",
+  "point of view", "tilt", "zoom",
+];
+
+const LIGHTING_KEYWORDS = [
+  "light", "lit", "lighting", "shadow", "glow", "backlit", "silhouette",
+  "sunlit", "moonlit", "neon", "golden hour", "rim light", "soft light",
+  "harsh light", "dim", "bright", "flicker", "candlelight", "spotlight",
+  "overcast", "sunset", "sunrise", "dusk", "dawn",
+];
+
 function sceneCountFor(duration: number): number {
   if (duration >= 60) return 5;
   if (duration >= 30) return 4;
@@ -66,7 +80,8 @@ Constraints:
 - same character identity in all scenes
 - smooth continuity between scenes
 - visual clarity and specificity
-- no generic descriptions`;
+- no generic descriptions
+- every scene description MUST explicitly mention a camera angle (wide / close-up / tracking / over-the-shoulder / etc.) and a lighting/mood word (light, shadow, glow, neon, golden hour, etc.)`;
 }
 
 function systemPrompt(scene_count: number): string {
@@ -85,7 +100,9 @@ Rules:
 - Keep each scene 5–8 seconds
 - Maintain the SAME main character across all scenes
 - Avoid vague or generic language
-- Output STRICT JSON only (no prose)
+- Each description MUST contain at least one camera keyword (wide, close-up, tracking, over-the-shoulder, medium shot, etc.)
+- Each description MUST contain at least one lighting/mood keyword (light, shadow, glow, neon, golden hour, dim, harsh, etc.)
+- Output STRICT JSON only (no prose, no code fences)
 
 Return format:
 [
@@ -106,14 +123,17 @@ function tryParseScenes(raw: string): PlannedScene[] | null {
   const start = text.indexOf("[");
   const end = text.lastIndexOf("]");
   if (start === -1 || end === -1 || end <= start) return null;
-  const slice = text.slice(start, end + 1);
   try {
-    const parsed = JSON.parse(slice);
-    if (!Array.isArray(parsed)) return null;
-    return parsed as PlannedScene[];
+    const parsed = JSON.parse(text.slice(start, end + 1));
+    return Array.isArray(parsed) ? (parsed as PlannedScene[]) : null;
   } catch {
     return null;
   }
+}
+
+function containsAny(text: string, keywords: string[]): boolean {
+  const lower = text.toLowerCase();
+  return keywords.some((k) => lower.includes(k));
 }
 
 function validateScenes(
@@ -138,6 +158,10 @@ function validateScenes(
       return { ok: false, reason: `scene ${order} description too short (${wordCount} words)` };
     if (!Number.isFinite(duration) || duration < 5 || duration > 8)
       return { ok: false, reason: `scene ${order} duration out of range` };
+    if (!containsAny(description, CAMERA_KEYWORDS))
+      return { ok: false, reason: `scene ${order} missing camera keyword` };
+    if (!containsAny(description, LIGHTING_KEYWORDS))
+      return { ok: false, reason: `scene ${order} missing lighting keyword` };
 
     cleaned.push({ scene_order: order, description, duration: Math.round(duration) });
   }
@@ -190,81 +214,113 @@ Deno.serve(async (req) => {
 
     const admin = createClient(SUPABASE_URL, SERVICE_KEY);
 
+    // 1. Fetch project
     const { data: project, error: pErr } = await admin
       .from("projects")
-      .select("id, prompt, style, target_duration, user_id")
+      .select("id, prompt, style, target_duration, user_id, status")
       .eq("id", project_id)
       .maybeSingle();
 
     if (pErr) return json({ error: pErr.message }, 500);
     if (!project) return json({ error: "project not found" }, 404);
 
+    // 2. Project lock — only run from "pending"
+    if (project.status !== "pending") {
+      return json(
+        { error: `project not in pending state (current: ${project.status})`, skipped: true },
+        409,
+      );
+    }
+
+    // 3. Idempotency — skip if scenes already exist
+    const { count: existingScenes } = await admin
+      .from("scenes")
+      .select("id", { count: "exact", head: true })
+      .eq("project_id", project_id);
+
+    if ((existingScenes ?? 0) > 0) {
+      return json({ success: true, skipped: true, scenes_created: existingScenes });
+    }
+
+    // 4. Atomic claim: pending -> planning, progress 20
+    const { data: claimed, error: claimErr } = await admin
+      .from("projects")
+      .update({ status: "planning", progress: 20, error_message: null })
+      .eq("id", project_id)
+      .eq("status", "pending")
+      .select("id")
+      .maybeSingle();
+
+    if (claimErr) return json({ error: claimErr.message }, 500);
+    if (!claimed) {
+      return json({ error: "another planScenes run already claimed this project", skipped: true }, 409);
+    }
+
+    // 5. Build enhanced prompt + scene count
     const { main_character, key_actions } = deriveCharacterAndActions(project.prompt);
     const enhanced = buildEnhancedPrompt(main_character, key_actions, project.style);
-
     const scene_count = Math.min(5, sceneCountFor(project.target_duration ?? 60));
     const sys = systemPrompt(scene_count);
 
-    await admin
-      .from("projects")
-      .update({ status: "planning", progress: 10, error_message: null })
-      .eq("id", project_id);
+    // 6. Call gateway with up to 2 retries (3 attempts total)
+    const correctionSuffix =
+      "\n\nFix the previous response.\nReturn STRICT JSON only.\nDo not include text outside JSON.\nFollow the exact schema.";
 
-    let attempt = await callGateway(LOVABLE_API_KEY, sys, enhanced);
-    if (attempt.status === 429)
-      return json({ error: "Rate limits exceeded, please try again later." }, 429);
-    if (attempt.status === 402)
-      return json(
-        { error: "Payment required, please add funds to your Lovable AI workspace." },
-        402,
-      );
-    if (attempt.status !== 200) {
-      console.error("gateway error:", attempt.error);
-      await admin
-        .from("projects")
-        .update({ status: "failed", error_message: "AI gateway error" })
-        .eq("id", project_id);
-      await admin.from("generation_logs").insert({
-        project_id,
-        step: "planning",
-        status: "error",
-        message: `gateway: ${attempt.error?.slice(0, 500) ?? "unknown"}`,
-      });
-      return json({ error: "AI gateway error" }, 500);
-    }
+    let parsed: PlannedScene[] | null = null;
+    let validation: ReturnType<typeof validateScenes> = { ok: false, reason: "no attempt yet" };
+    let lastError: string | undefined;
 
-    let parsed = tryParseScenes(attempt.content);
-    let validation = validateScenes(parsed, scene_count);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const userMsg = attempt === 0 ? enhanced : enhanced + correctionSuffix +
+        (validation.ok ? "" : `\nPrevious error: ${validation.reason}`);
 
-    if (!validation.ok) {
-      console.warn("first attempt invalid:", validation.reason);
-      const retry = await callGateway(
-        LOVABLE_API_KEY,
-        sys,
-        `${enhanced}\n\nFix to STRICT JSON, same schema, no extra text.`,
-      );
-      if (retry.status === 200) {
-        parsed = tryParseScenes(retry.content);
-        validation = validateScenes(parsed, scene_count);
+      const result = await callGateway(LOVABLE_API_KEY, sys, userMsg);
+
+      if (result.status === 429) {
+        await admin
+          .from("projects")
+          .update({ status: "pending", error_message: null })
+          .eq("id", project_id);
+        return json({ error: "Rate limits exceeded, please try again later." }, 429);
       }
+      if (result.status === 402) {
+        await admin
+          .from("projects")
+          .update({ status: "pending", error_message: null })
+          .eq("id", project_id);
+        return json(
+          { error: "Payment required, please add funds to your Lovable AI workspace." },
+          402,
+        );
+      }
+      if (result.status !== 200) {
+        lastError = result.error;
+        console.error(`attempt ${attempt + 1} gateway error:`, result.error);
+        continue;
+      }
+
+      parsed = tryParseScenes(result.content);
+      validation = validateScenes(parsed, scene_count);
+      if (validation.ok) break;
+      console.warn(`attempt ${attempt + 1} invalid: ${validation.reason}`);
     }
 
     if (!validation.ok) {
+      const reason = lastError ?? (validation as { reason: string }).reason;
       await admin
         .from("projects")
-        .update({ status: "failed", error_message: `planning failed: ${validation.reason}` })
+        .update({ status: "failed", error_message: `planning failed: ${reason}` })
         .eq("id", project_id);
       await admin.from("generation_logs").insert({
         project_id,
         step: "planning",
         status: "error",
-        message: `invalid scenes: ${validation.reason}`,
+        message: `invalid scenes after 3 attempts: ${reason}`,
       });
-      return json({ error: "invalid scenes from model", reason: validation.reason }, 502);
+      return json({ error: "invalid scenes from model", reason }, 502);
     }
 
-    await admin.from("scenes").delete().eq("project_id", project_id);
-
+    // 7. Insert scenes
     const rows = validation.scenes.map((s) => ({
       project_id,
       scene_order: s.scene_order,
@@ -288,9 +344,10 @@ Deno.serve(async (req) => {
       return json({ error: insErr.message }, 500);
     }
 
+    // 8. Scenes saved → progress 30, move to generating
     await admin
       .from("projects")
-      .update({ status: "generating", progress: 25 })
+      .update({ status: "generating", progress: 30 })
       .eq("id", project_id);
 
     await admin.from("generation_logs").insert({
