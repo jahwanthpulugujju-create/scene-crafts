@@ -105,14 +105,9 @@ Deno.serve(async (req) => {
       return json({ error: `project not in frames_ready state (current: ${project.status})`, skipped: true }, 409);
     }
 
-    if (!WORKER_ENDPOINT) {
-      await admin.from("generation_logs").insert({
-        project_id,
-        step: "build_clips",
-        status: "error",
-        message: "WORKER_ENDPOINT not configured",
-      });
-      return json({ error: "WORKER_ENDPOINT not configured. Add the secret to enable clip building." }, 503);
+    const MOCK_MODE = !WORKER_ENDPOINT;
+    if (MOCK_MODE) {
+      console.log("buildSceneVideos: running in MOCK mode (WORKER_ENDPOINT not set)");
     }
 
     // Fetch scenes that need clips
