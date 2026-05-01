@@ -164,7 +164,13 @@ Deno.serve(async (req) => {
         duration: scene.duration,
       };
 
-      const result = await callWorkerWithRetry(WORKER_ENDPOINT, WORKER_API_KEY, payload);
+      const result = MOCK_MODE
+        ? {
+            ok: true as const,
+            video_url:
+              "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+          }
+        : await callWorkerWithRetry(WORKER_ENDPOINT!, WORKER_API_KEY, payload);
 
       if (!result.ok) {
         await admin.from("generation_logs").insert({
