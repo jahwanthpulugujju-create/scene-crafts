@@ -177,8 +177,15 @@ Deno.serve(async (req) => {
         seed,
       };
 
-      // 5. Call endpoint with retries
-      const result = await callColabWithRetry(COLAB_ENDPOINT_URL, COLAB_API_KEY, payload);
+      // 5. Call endpoint with retries (or generate mock URLs)
+      const result = MOCK_MODE
+        ? {
+            ok: true as const,
+            images: Array.from({ length: FRAMES_PER_SCENE }, (_, i) =>
+              `https://placehold.co/768x768/0f172a/ffffff?text=Scene+${scene.scene_order}+Frame+${i + 1}`,
+            ),
+          }
+        : await callColabWithRetry(COLAB_ENDPOINT_URL!, COLAB_API_KEY, payload);
 
       if (!result.ok) {
         await admin
