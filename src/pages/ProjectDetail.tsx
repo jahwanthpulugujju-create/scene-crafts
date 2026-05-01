@@ -184,8 +184,8 @@ const ProjectDetail = () => {
               </dl>
 
               {project.status === "pending" && (
-                <Button onClick={startGeneration} className="mt-5 w-full bg-gradient-primary text-primary-foreground hover:opacity-90">
-                  <Sparkles className="mr-2 h-4 w-4" /> Start generation
+                <Button onClick={startGeneration} disabled={running} className="mt-5 w-full bg-gradient-primary text-primary-foreground hover:opacity-90">
+                  <Sparkles className="mr-2 h-4 w-4" /> {running ? "Generating…" : "Start generation"}
                 </Button>
               )}
             </div>
