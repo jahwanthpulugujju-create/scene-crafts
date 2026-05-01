@@ -18,6 +18,7 @@ export type Database = {
         Row: {
           created_at: string
           id: string
+          metadata: Json
           path: string
           project_id: string
           type: string
@@ -26,6 +27,7 @@ export type Database = {
         Insert: {
           created_at?: string
           id?: string
+          metadata?: Json
           path: string
           project_id: string
           type: string
@@ -34,6 +36,7 @@ export type Database = {
         Update: {
           created_at?: string
           id?: string
+          metadata?: Json
           path?: string
           project_id?: string
           type?: string
@@ -206,6 +209,8 @@ export type Database = {
         | "stitching"
         | "completed"
         | "failed"
+        | "frames_ready"
+        | "clips_ready"
       scene_status: "pending" | "generating" | "completed" | "failed"
     }
     CompositeTypes: {
@@ -341,6 +346,8 @@ export const Constants = {
         "stitching",
         "completed",
         "failed",
+        "frames_ready",
+        "clips_ready",
       ],
       scene_status: ["pending", "generating", "completed", "failed"],
     },
