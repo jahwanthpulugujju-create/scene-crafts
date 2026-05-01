@@ -42,8 +42,33 @@ const ProjectDetail = () => {
     return () => { active = false; supabase.removeChannel(channel); };
   }, [id]);
 
+  const [running, setRunning] = useState(false);
+
+  const runStep = async (fn: string) => {
+    const { data, error } = await supabase.functions.invoke(fn, { body: { project_id: id } });
+    if (error) throw new Error(error.message);
+    if ((data as any)?.error) throw new Error((data as any).error);
+    return data;
+  };
+
   const startGeneration = async () => {
-    toast.info("Generation pipeline will be wired up in the next phase");
+    if (!id || running) return;
+    setRunning(true);
+    try {
+      toast.info("Planning scenes…");
+      await runStep("planScenes");
+      toast.info("Generating frames…");
+      await runStep("generateSceneFrames");
+      toast.info("Building scene clips…");
+      await runStep("buildSceneVideos");
+      toast.info("Stitching final video…");
+      await runStep("stitchProjectVideo");
+      toast.success("Generation complete!");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Generation failed");
+    } finally {
+      setRunning(false);
+    }
   };
 
   if (loading) {
