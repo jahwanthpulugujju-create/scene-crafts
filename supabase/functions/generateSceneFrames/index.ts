@@ -114,14 +114,9 @@ Deno.serve(async (req) => {
       return json({ error: `project not in generating state (current: ${project.status})`, skipped: true }, 409);
     }
 
-    if (!COLAB_ENDPOINT_URL) {
-      await admin.from("generation_logs").insert({
-        project_id,
-        step: "frame_generation",
-        status: "error",
-        message: "COLAB_ENDPOINT_URL not configured",
-      });
-      return json({ error: "COLAB_ENDPOINT_URL not configured. Add the secret to enable frame generation." }, 503);
+    const MOCK_MODE = !COLAB_ENDPOINT_URL;
+    if (MOCK_MODE) {
+      console.log("generateSceneFrames: running in MOCK mode (COLAB_ENDPOINT_URL not set)");
     }
 
     // 2. Fetch scenes needing work
