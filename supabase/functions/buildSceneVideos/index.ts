@@ -110,7 +110,7 @@ Deno.serve(async (req) => {
       console.log("buildSceneVideos: running in MOCK mode (WORKER_ENDPOINT not set)");
     }
 
-    // Fetch scenes that need clips
+    // Fetch scenes that need clips (idempotency: only those without video_url)
     const { data: scenes, error: sErr } = await admin
       .from("scenes")
       .select("id, scene_order, duration, status, video_url")
