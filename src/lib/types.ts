@@ -2,6 +2,8 @@ export type ProjectStatus =
   | "pending"
   | "planning"
   | "generating"
+  | "frames_ready"
+  | "clips_ready"
   | "stitching"
   | "completed"
   | "failed";
@@ -41,11 +43,33 @@ export interface Scene {
   updated_at: string;
 }
 
+export interface GenerationLog {
+  id: string;
+  project_id: string;
+  step: string;
+  status: string;
+  message: string | null;
+  created_at: string;
+}
+
 export const STATUS_LABEL: Record<ProjectStatus, string> = {
   pending: "Pending",
   planning: "Planning scenes",
-  generating: "Generating clips",
+  generating: "Generating scenes",
+  frames_ready: "Frames ready",
+  clips_ready: "Clips ready",
   stitching: "Stitching video",
   completed: "Completed",
+  failed: "Failed",
+};
+
+export const STAGE_LABEL: Record<ProjectStatus, string> = {
+  pending: "Idle",
+  planning: "Planning scenes",
+  generating: "Generating scenes",
+  frames_ready: "Generating scenes",
+  clips_ready: "Building clips",
+  stitching: "Stitching final video",
+  completed: "Done",
   failed: "Failed",
 };
