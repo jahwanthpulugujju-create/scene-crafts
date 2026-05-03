@@ -183,9 +183,34 @@ const ProjectDetail = () => {
                 <div className="flex justify-between"><dt className="text-muted-foreground">Scenes</dt><dd>{scenes.length}</dd></div>
               </dl>
 
-              {project.status === "pending" && (
+              {project.status !== "completed" && (
                 <Button onClick={startGeneration} disabled={running} className="mt-5 w-full bg-gradient-primary text-primary-foreground hover:opacity-90">
-                  <Sparkles className="mr-2 h-4 w-4" /> {running ? "Generating…" : "Start generation"}
+                  <Sparkles className="mr-2 h-4 w-4" />
+                  {running
+                    ? "Generating…"
+                    : project.status === "pending"
+                      ? "Start generation"
+                      : "Resume / Retry"}
+                </Button>
+              )}
+              {project.status !== "pending" && project.status !== "completed" && !running && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="mt-2 w-full"
+                  onClick={async () => {
+                    if (!id) return;
+                    if (!confirm("Reset project? This deletes scenes & frames so generation starts over.")) return;
+                    await supabase.from("assets").delete().eq("project_id", id);
+                    await supabase.from("scenes").delete().eq("project_id", id);
+                    await supabase
+                      .from("projects")
+                      .update({ status: "pending", progress: 0, error_message: null, final_video_url: null })
+                      .eq("id", id);
+                    toast.success("Project reset");
+                  }}
+                >
+                  Reset project
                 </Button>
               )}
             </div>
