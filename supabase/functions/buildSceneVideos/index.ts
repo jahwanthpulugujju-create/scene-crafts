@@ -168,7 +168,7 @@ Deno.serve(async (req) => {
         ? {
             ok: true as const,
             video_url:
-              "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+              "https://download.samplelib.com/mp4/sample-5s.mp4",
           }
         : await callWorkerWithRetry(WORKER_ENDPOINT!, WORKER_API_KEY, payload);
 
