@@ -14,77 +14,111 @@ const json = (body: unknown, status = 200) =>
 
 const FRAMES_PER_SCENE = 6;
 const MIN_FRAMES = 5;
-const REQUEST_TIMEOUT_MS = 120_000;
-const RETRY_BACKOFFS_MS = [2000, 5000];
+const AI_GATEWAY_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
+const IMAGE_MODEL = "google/gemini-2.5-flash-image";
 
 interface SceneRow {
   id: string;
   project_id: string;
   scene_order: number;
   description: string;
+  action: string | null;
+  environment: string | null;
+  camera: string | null;
+  mood: string | null;
   duration: number;
   status: string;
 }
 
-function projectSeed(project_id: string): number {
-  // Deterministic seed per project so re-runs reuse the same character identity.
-  let h = 2166136261;
-  for (let i = 0; i < project_id.length; i++) {
-    h ^= project_id.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return Math.abs(h) % 2_147_483_647;
+interface ProjectRow {
+  id: string;
+  user_id: string;
+  status: string;
+  prompt: string;
+  style: string | null;
+  character_image_url: string | null;
 }
 
-async function callColab(
-  endpoint: string,
-  apiKey: string | undefined,
-  payload: Record<string, unknown>,
-): Promise<{ ok: true; images: string[] } | { ok: false; reason: string }> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+/** Strip a data: URL prefix if present and return raw base64 + mime. */
+function parseDataUrl(s: string): { mime: string; b64: string } | null {
+  const m = s.match(/^data:([^;]+);base64,(.+)$/);
+  if (!m) return null;
+  return { mime: m[1], b64: m[2] };
+}
 
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+function b64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 
+/** Call Lovable AI image model, return one image as bytes. */
+async function generateOneFrame(
+  apiKey: string,
+  prompt: string,
+): Promise<{ ok: true; bytes: Uint8Array; mime: string } | { ok: false; reason: string }> {
   try {
-    const resp = await fetch(endpoint, {
+    const resp = await fetch(AI_GATEWAY_URL, {
       method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: IMAGE_MODEL,
+        messages: [{ role: "user", content: prompt }],
+        modalities: ["image", "text"],
+      }),
     });
+    if (resp.status === 429) return { ok: false, reason: "rate_limited" };
+    if (resp.status === 402) return { ok: false, reason: "payment_required" };
     if (!resp.ok) {
-      const txt = await resp.text().catch(() => "");
-      return { ok: false, reason: `HTTP ${resp.status}: ${txt.slice(0, 200)}` };
+      const t = await resp.text().catch(() => "");
+      return { ok: false, reason: `gateway ${resp.status}: ${t.slice(0, 200)}` };
     }
-    const data = await resp.json().catch(() => null);
-    const images = Array.isArray(data?.images) ? data.images.filter((u: unknown) => typeof u === "string") : [];
-    if (images.length < MIN_FRAMES || images.length > FRAMES_PER_SCENE) {
-      return { ok: false, reason: `expected ${MIN_FRAMES}-${FRAMES_PER_SCENE} images, got ${images.length}` };
+    const data = await resp.json();
+    // The image model returns images in choices[0].message.images[0].image_url.url as a data: URL.
+    const choice = data?.choices?.[0]?.message;
+    const imgUrl: string | undefined =
+      choice?.images?.[0]?.image_url?.url ?? choice?.images?.[0]?.url;
+    if (!imgUrl) return { ok: false, reason: "no image in response" };
+
+    const parsed = parseDataUrl(imgUrl);
+    if (parsed) {
+      return { ok: true, bytes: b64ToBytes(parsed.b64), mime: parsed.mime };
     }
-    return { ok: true, images };
+    // Fallback: it's an http(s) URL — fetch the bytes
+    const r = await fetch(imgUrl);
+    if (!r.ok) return { ok: false, reason: `fetch image ${r.status}` };
+    const buf = new Uint8Array(await r.arrayBuffer());
+    return { ok: true, bytes: buf, mime: r.headers.get("content-type") ?? "image/png" };
   } catch (e) {
-    return { ok: false, reason: e instanceof Error ? e.message : "unknown fetch error" };
-  } finally {
-    clearTimeout(t);
+    return { ok: false, reason: e instanceof Error ? e.message : "unknown error" };
   }
 }
 
-async function callColabWithRetry(
-  endpoint: string,
-  apiKey: string | undefined,
-  payload: Record<string, unknown>,
-): Promise<{ ok: true; images: string[] } | { ok: false; reason: string }> {
-  let last: { ok: false; reason: string } = { ok: false, reason: "no attempts" };
-  for (let attempt = 0; attempt <= RETRY_BACKOFFS_MS.length; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, RETRY_BACKOFFS_MS[attempt - 1]));
-    const res = await callColab(endpoint, apiKey, payload);
-    if (res.ok) return res;
-    last = res;
-    console.warn(`generateSceneFrames attempt ${attempt + 1} failed: ${res.reason}`);
-  }
-  return last;
+function buildScenePrompt(project: ProjectRow, scene: SceneRow, frameIndex: number, totalFrames: number): string {
+  const stylePart = project.style ? `Style: ${project.style}.` : "";
+  const characterPart = project.character_image_url
+    ? "Maintain the EXACT same main character (face, hair, clothing, body type) consistent across every frame and every scene of this project."
+    : "Maintain a single consistent main character (face, hair, clothing) across every frame and scene.";
+  const beat = `Frame ${frameIndex + 1} of ${totalFrames} in this scene — capture the moment progressing slightly forward in time, like a movie storyboard panel.`;
+
+  return [
+    `Cinematic film still. ${stylePart}`,
+    `Project concept: ${project.prompt}`,
+    `Scene ${scene.scene_order}: ${scene.description}`,
+    scene.action ? `Action: ${scene.action}.` : "",
+    scene.environment ? `Environment: ${scene.environment}.` : "",
+    scene.camera ? `Camera: ${scene.camera}.` : "",
+    scene.mood ? `Mood: ${scene.mood}.` : "",
+    characterPart,
+    beat,
+    "High detail, natural lighting, no text, no watermarks, 16:9 framing.",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 Deno.serve(async (req) => {
@@ -93,8 +127,10 @@ Deno.serve(async (req) => {
   try {
     const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
     const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const COLAB_ENDPOINT_URL = Deno.env.get("COLAB_ENDPOINT_URL");
-    const COLAB_API_KEY = Deno.env.get("COLAB_API_KEY"); // optional
+    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
+    if (!LOVABLE_API_KEY) {
+      return json({ error: "LOVABLE_API_KEY not configured" }, 500);
+    }
 
     const body = await req.json().catch(() => ({}));
     const project_id = typeof body?.project_id === "string" ? body.project_id : null;
@@ -102,10 +138,9 @@ Deno.serve(async (req) => {
 
     const admin = createClient(SUPABASE_URL, SERVICE_KEY);
 
-    // 1. Fetch project
     const { data: project, error: pErr } = await admin
       .from("projects")
-      .select("id, status, progress, user_id")
+      .select("id, user_id, status, prompt, style, character_image_url")
       .eq("id", project_id)
       .maybeSingle();
     if (pErr) return json({ error: pErr.message }, 500);
@@ -114,35 +149,29 @@ Deno.serve(async (req) => {
       return json({ error: `project not in generating state (current: ${project.status})`, skipped: true }, 409);
     }
 
-    const MOCK_MODE = !COLAB_ENDPOINT_URL;
-    if (MOCK_MODE) {
-      console.log("generateSceneFrames: running in MOCK mode (COLAB_ENDPOINT_URL not set)");
-    }
-
-    // 2. Fetch scenes needing work
     const { data: scenes, error: sErr } = await admin
       .from("scenes")
-      .select("id, project_id, scene_order, description, duration, status")
+      .select("id, project_id, scene_order, description, action, environment, camera, mood, duration, status")
       .eq("project_id", project_id)
       .in("status", ["pending", "failed"])
       .order("scene_order", { ascending: true });
     if (sErr) return json({ error: sErr.message }, 500);
 
-    const { data: allScenes } = await admin
+    const { count: totalScenes } = await admin
       .from("scenes")
-      .select("id, status")
+      .select("id", { count: "exact", head: true })
       .eq("project_id", project_id);
-    const totalScenes = allScenes?.length ?? 0;
 
     if (!scenes || scenes.length === 0) {
       return json({ success: true, message: "no work", processed_scenes: 0 });
     }
 
-    const seed = projectSeed(project_id);
     let processed = 0;
+    let rateLimited = false;
+    let paymentRequired = false;
 
     for (const scene of scenes as SceneRow[]) {
-      // 3. Idempotency check
+      // Idempotency: skip if already has enough frames
       const { count: existing } = await admin
         .from("assets")
         .select("id", { count: "exact", head: true })
@@ -156,52 +185,9 @@ Deno.serve(async (req) => {
         continue;
       }
 
-      // Mark scene as generating
       await admin.from("scenes").update({ status: "generating", error_message: null }).eq("id", scene.id);
 
-      // 4. Build payload
-      const enhanced_prompt =
-        `Same character, same face, same clothing, consistent identity, cinematic, ultra-detailed, ${scene.description}`;
-      const negative_prompt =
-        "blurry, distorted face, extra limbs, inconsistent identity, low quality";
-      const payload = {
-        scene_id: scene.id,
-        project_id,
-        prompt: enhanced_prompt,
-        negative_prompt,
-        num_images: FRAMES_PER_SCENE,
-        width: 768,
-        height: 768,
-        steps: 25,
-        guidance_scale: 7.5,
-        seed,
-      };
-
-      // 5. Call endpoint with retries (or generate mock URLs)
-      const result = MOCK_MODE
-        ? {
-            ok: true as const,
-            images: Array.from({ length: FRAMES_PER_SCENE }, (_, i) =>
-              `https://placehold.co/768x768/0f172a/ffffff?text=Scene+${scene.scene_order}+Frame+${i + 1}`,
-            ),
-          }
-        : await callColabWithRetry(COLAB_ENDPOINT_URL!, COLAB_API_KEY, payload);
-
-      if (!result.ok) {
-        await admin
-          .from("scenes")
-          .update({ status: "failed", error_message: `frame_generation: ${result.reason}` })
-          .eq("id", scene.id);
-        await admin.from("generation_logs").insert({
-          project_id,
-          step: "frame_generation",
-          status: "error",
-          message: `scene ${scene.scene_order} failed: ${result.reason}`,
-        });
-        continue;
-      }
-
-      // 6. Persist frames (clear partials first to avoid duplicates)
+      // Clear partial frames for clean retry
       await admin
         .from("assets")
         .delete()
@@ -209,12 +195,54 @@ Deno.serve(async (req) => {
         .eq("type", "frame")
         .eq("metadata->>scene_id", scene.id);
 
-      const rows = result.images.slice(0, FRAMES_PER_SCENE).map((url, index) => ({
+      const generated: { url: string; index: number }[] = [];
+      let sceneFailed: string | null = null;
+
+      for (let i = 0; i < FRAMES_PER_SCENE; i++) {
+        const prompt = buildScenePrompt(project as ProjectRow, scene, i, FRAMES_PER_SCENE);
+        const result = await generateOneFrame(LOVABLE_API_KEY, prompt);
+        if (!result.ok) {
+          if (result.reason === "rate_limited") rateLimited = true;
+          if (result.reason === "payment_required") paymentRequired = true;
+          sceneFailed = result.reason;
+          break;
+        }
+        // Upload to media bucket
+        const ext = result.mime.includes("jpeg") ? "jpg" : "png";
+        const path = `frames/${project.user_id}/${project_id}/${scene.id}/${i}.${ext}`;
+        const { error: upErr } = await admin.storage
+          .from("media")
+          .upload(path, result.bytes, { contentType: result.mime, upsert: true });
+        if (upErr) {
+          sceneFailed = `upload: ${upErr.message}`;
+          break;
+        }
+        const { data: pub } = admin.storage.from("media").getPublicUrl(path);
+        generated.push({ url: pub.publicUrl, index: i });
+      }
+
+      if (sceneFailed || generated.length < MIN_FRAMES) {
+        const reason = sceneFailed ?? `only ${generated.length} frames generated`;
+        await admin
+          .from("scenes")
+          .update({ status: "failed", error_message: `frame_generation: ${reason}` })
+          .eq("id", scene.id);
+        await admin.from("generation_logs").insert({
+          project_id,
+          step: "frame_generation",
+          status: "error",
+          message: `scene ${scene.scene_order} failed: ${reason}`,
+        });
+        if (rateLimited || paymentRequired) break; // stop the whole run early
+        continue;
+      }
+
+      const rows = generated.map((g) => ({
         project_id,
         type: "frame",
-        url,
-        path: `frames/${scene.id}/${index}`,
-        metadata: { scene_id: scene.id, index },
+        url: g.url,
+        path: `frames/${scene.id}/${g.index}`,
+        metadata: { scene_id: scene.id, index: g.index },
       }));
 
       const { error: insErr } = await admin.from("assets").insert(rows);
@@ -223,12 +251,6 @@ Deno.serve(async (req) => {
           .from("scenes")
           .update({ status: "failed", error_message: `asset insert: ${insErr.message}` })
           .eq("id", scene.id);
-        await admin.from("generation_logs").insert({
-          project_id,
-          step: "frame_generation",
-          status: "error",
-          message: `scene ${scene.scene_order} insert failed: ${insErr.message}`,
-        });
         continue;
       }
 
@@ -237,36 +259,44 @@ Deno.serve(async (req) => {
         project_id,
         step: "frame_generation",
         status: "success",
-        message: `scene ${scene.scene_order}: ${rows.length} frames`,
+        message: `scene ${scene.scene_order}: ${rows.length} AI frames`,
       });
       processed++;
 
-      // 7. Progress 30 -> 70
-      const { data: doneCountData } = await admin
-        .from("scenes")
-        .select("id", { count: "exact", head: true })
-        .eq("project_id", project_id)
-        .eq("status", "completed");
-      const completed = (doneCountData as unknown as { length?: number })?.length ?? 0;
-      void completed; // count comes from head request below
+      // Progress 30 -> 70
       const { count: completedCount } = await admin
         .from("scenes")
         .select("id", { count: "exact", head: true })
         .eq("project_id", project_id)
         .eq("status", "completed");
-      const ratio = totalScenes > 0 ? (completedCount ?? 0) / totalScenes : 0;
+      const ratio = (totalScenes ?? 0) > 0 ? (completedCount ?? 0) / (totalScenes ?? 1) : 0;
       const progress = Math.min(70, Math.max(30, Math.round(30 + ratio * 40)));
       await admin.from("projects").update({ progress }).eq("id", project_id);
     }
 
-    // 8. Completion check
+    if (paymentRequired) {
+      await admin.from("projects").update({
+        status: "failed",
+        error_message: "Lovable AI credits exhausted. Add credits in Settings → Workspace → Usage.",
+      }).eq("id", project_id);
+      return json({ error: "payment_required" }, 402);
+    }
+    if (rateLimited) {
+      await admin.from("projects").update({
+        status: "failed",
+        error_message: "Lovable AI rate limit hit. Wait a minute and retry.",
+      }).eq("id", project_id);
+      return json({ error: "rate_limited" }, 429);
+    }
+
+    // Completion check
     const { count: completedTotal } = await admin
       .from("scenes")
       .select("id", { count: "exact", head: true })
       .eq("project_id", project_id)
       .eq("status", "completed");
 
-    if (totalScenes > 0 && completedTotal === totalScenes) {
+    if ((totalScenes ?? 0) > 0 && completedTotal === totalScenes) {
       await admin
         .from("projects")
         .update({ status: "frames_ready", progress: 70 })
