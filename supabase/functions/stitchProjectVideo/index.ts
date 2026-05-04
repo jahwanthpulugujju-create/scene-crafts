@@ -149,14 +149,17 @@ Deno.serve(async (req) => {
     let final_video_url: string;
 
     if (!STITCH_WORKER_ENDPOINT) {
-      // Mock: use first clip as placeholder
-      final_video_url = orderedClips[0] ?? `/mock/final_project_${project_id}.mp4`;
+      await admin.from("projects").update({
+        status: "failed",
+        error_message: "Clips ready, but no stitch worker is configured. Set STITCH_WORKER_ENDPOINT to your FFmpeg concat worker URL.",
+      }).eq("id", project_id);
       await admin.from("generation_logs").insert({
         project_id,
         step: "stitch",
-        status: "success",
-        message: "mock stitch (STITCH_WORKER_ENDPOINT not configured)",
+        status: "error",
+        message: "STITCH_WORKER_ENDPOINT not configured",
       });
+      return json({ error: "STITCH_WORKER_ENDPOINT not configured", clips_ready: true }, 400);
     } else {
       const result = await callWorkerWithRetry(STITCH_WORKER_ENDPOINT, STITCH_WORKER_API_KEY, {
         project_id,

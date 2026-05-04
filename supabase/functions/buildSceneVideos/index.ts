@@ -164,13 +164,20 @@ Deno.serve(async (req) => {
         duration: scene.duration,
       };
 
-      const result = MOCK_MODE
-        ? {
-            ok: true as const,
-            video_url:
-              "https://download.samplelib.com/mp4/sample-5s.mp4",
-          }
-        : await callWorkerWithRetry(WORKER_ENDPOINT!, WORKER_API_KEY, payload);
+      if (MOCK_MODE) {
+        await admin.from("generation_logs").insert({
+          project_id,
+          step: "build_clips",
+          status: "error",
+          message: "WORKER_ENDPOINT not configured — cannot build real clips from frames",
+        });
+        await admin.from("projects").update({
+          status: "failed",
+          error_message: "Frames are ready, but no FFmpeg worker is configured. Set WORKER_ENDPOINT to a frames→MP4 worker URL.",
+        }).eq("id", project_id);
+        return json({ error: "WORKER_ENDPOINT not configured", frames_ready: true }, 400);
+      }
+      const result = await callWorkerWithRetry(WORKER_ENDPOINT!, WORKER_API_KEY, payload);
 
       if (!result.ok) {
         await admin.from("generation_logs").insert({
